@@ -5,39 +5,51 @@ import os
 import shutil
 import tiktoken
 import yaml
-from typing import Dict, List, Any, Union, Optional
+from typing import Dict, List, Union
 from collections import Counter
 from datetime import datetime, time, timedelta
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest
 from astrbot.api import logger
-
-import aiohttp
 from aiohttp import web
 
 LOG_PREFIX = "[✨Token统计✨] "
-
-# 会话消息最大保留数量
 MAX_SESSION_MESSAGES = 100
-
 
 @register(
     "astrbot_plugin_token_stats",
-    "your_name",
-    "自动统计每次 LLM 请求的 token 消耗，支持 /tokenstats 命令查询，按会话区分统计，输入输出均采用 API 返回的真实值",
-    "3.9.15",
-    "https://github.com/yourname/astrbot_plugin_token_stats"
+    "HAOoool",
+    "自动统计每次 LLM 请求的 token 消耗，支持 /tokenstats 命令查询，按会话区分统计",
+    "3.9.16",
+    "https://github.com/HAOoool/astrbot-plugin-token-stats"
 )
 class TokenStatsPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.plugin_dir = os.path.dirname(__file__)
         self.config = self._load_config()
         self.plugin_rules = self.config.get("plugins", [])
+        self.log_message_content = self.config.get("log_message_content", False)
+        self.webui_token = self.config.get("webui_token", "")
+
+        # 获取插件数据目录（用于存放 daily_stats.json）
+        try:
+            self.data_dir = self.context.get_plugin_data_dir()
+        except AttributeError:
+            # 兼容旧版 AstrBot，使用插件目录下的 data 子目录
+            self.data_dir = os.path.join(self.plugin_dir, "data")
+            if not os.path.exists(self.data_dir):
+                os.makedirs(self.data_dir, exist_ok=True)
+            logger.warning(f"{LOG_PREFIX}当前 AstrBot 版本不支持 get_plugin_data_dir，将使用本地 data 目录: {self.data_dir}")
+
+        # 会话相关状态
         self.session_stats: Dict[str, Dict[str, int]] = {}
         self.session_messages: Dict[str, List[Dict]] = {}
+        self._session_lock = asyncio.Lock()
 
+        # 每日统计
         self.daily_stats: Dict[str, Dict[str, Dict[str, int]]] = {}
         self.current_date = datetime.now().date()
         self.current_session_today_counter: Dict[str, Dict[str, int]] = {}
@@ -47,13 +59,14 @@ class TokenStatsPlugin(Star):
         self._load_daily_stats()
         self._daily_task = asyncio.create_task(self._daily_reset_loop())
 
+        # Web 服务
         self.web_app = None
         self.web_runner = None
         self.web_task = asyncio.create_task(self._start_web_server())
 
     # ---------- 配置加载 ----------
     def _load_config(self) -> dict:
-        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        config_path = os.path.join(self.plugin_dir, "config.yaml")
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r", encoding="utf-8") as f:
@@ -62,8 +75,6 @@ class TokenStatsPlugin(Star):
                         config = {}
                     if "plugins" not in config or config["plugins"] is None:
                         config["plugins"] = []
-                    # 读取统一统计开关（目前保留供未来使用）
-                    self.use_unified_stats = config.get("use_unified_stats", False)
                     return config
             except Exception as e:
                 logger.error(f"{LOG_PREFIX}加载配置文件失败: {e}")
@@ -110,38 +121,35 @@ class TokenStatsPlugin(Star):
     # ---------- 消息分类与统计 ----------
     def classify_messages(self, messages: List[Dict]) -> Dict[str, List[Dict]]:
         result = {"persona": [], "context": [], "unclassified": []}
-        
         # 初始化插件分类列表
         for rule in self.plugin_rules:
-            plugin_name = rule["name"]
-            result[f"plugin_{plugin_name}"] = []
+            plugin_name = rule.get("name")
+            if plugin_name:
+                result[f"plugin_{plugin_name}"] = []
 
         for msg in messages:
             matched = False
-            
-            # 先尝试匹配插件规则（包括系统消息）
             for rule in self.plugin_rules:
-                plugin_name = rule["name"]
+                plugin_name = rule.get("name")
+                if not plugin_name:
+                    continue
                 match_criteria = rule.get("match", {})
                 if self._matches_rule(msg, match_criteria):
                     result[f"plugin_{plugin_name}"].append(msg)
                     matched = True
                     break
-            
-            # 如果没有匹配任何规则，按角色分类
             if not matched:
                 if msg.get("role") == "system":
                     result["persona"].append(msg)
                 else:
                     result["context"].append(msg)
-        
         return result
 
     def _matches_rule(self, msg: Dict, criteria: Dict) -> bool:
         if "role" in criteria and msg.get("role") != criteria["role"]:
             return False
         if "name_contains" in criteria:
-            name = msg.get("name") or ""  # 修复：防止 name 为 None
+            name = msg.get("name") or ""
             if criteria["name_contains"] not in name:
                 return False
         content_text = self.extract_text(msg.get("content"))
@@ -170,7 +178,7 @@ class TokenStatsPlugin(Star):
 
     # ---------- 每日统计持久化 ----------
     def _get_stats_file_path(self) -> str:
-        return os.path.join(os.path.dirname(__file__), "daily_stats.json")
+        return os.path.join(self.data_dir, "daily_stats.json")
 
     def _load_daily_stats(self):
         path = self._get_stats_file_path()
@@ -207,8 +215,6 @@ class TokenStatsPlugin(Star):
             for key, value in stats.items():
                 if key.endswith("_tokens"):
                     today_counter[key] = today_counter.get(key, 0) + value
-            if "total_tokens" in stats:
-                today_counter["total_tokens"] = today_counter.get("total_tokens", 0) + stats["total_tokens"]
 
     async def _add_daily_io_tokens(self, session_id: str, input_tokens: int, output_tokens: int):
         if not input_tokens and not output_tokens:
@@ -258,7 +264,6 @@ class TokenStatsPlugin(Star):
                 break
             except Exception as e:
                 logger.error(f"{LOG_PREFIX}每日重置循环出错: {e}")
-                # 出错后等待一小时再重试
                 await asyncio.sleep(3600)
 
     # ---------- 消息规范化 ----------
@@ -270,7 +275,6 @@ class TokenStatsPlugin(Star):
             elif isinstance(msg, str):
                 normalized.append({"role": "user", "content": msg})
             else:
-                # 尝试从非字典对象中提取 role 和 content
                 try:
                     role = getattr(msg, 'role', None)
                     content = getattr(msg, 'content', None)
@@ -282,21 +286,16 @@ class TokenStatsPlugin(Star):
                     logger.warning(f"{LOG_PREFIX}无法处理的消息对象: {type(msg)}")
         return normalized
 
-    # ---------- 辅助方法：获取完整会话 ID ----------
+    # ---------- 辅助方法 ----------
     def _get_full_session_id(self, event: AstrMessageEvent) -> str:
         if hasattr(event, 'unified_msg_origin') and event.unified_msg_origin:
-            sid = event.unified_msg_origin
-            logger.debug(f"{LOG_PREFIX}从 unified_msg_origin 获取到会话ID: {sid}")
-            return sid
+            return event.unified_msg_origin
         if hasattr(event, 'get_session_id'):
             sid = event.get_session_id()
             if sid:
-                logger.debug(f"{LOG_PREFIX}从 get_session_id 获取到会话ID: {sid}")
                 return sid
         if hasattr(event, 'session_id') and event.session_id:
-            sid = event.session_id
-            logger.debug(f"{LOG_PREFIX}从 session_id 属性获取到会话ID: {sid}")
-            return sid
+            return event.session_id
         logger.warning(f"{LOG_PREFIX}无法获取会话ID，使用默认值 unknown")
         return "unknown"
 
@@ -307,10 +306,10 @@ class TokenStatsPlugin(Star):
 
         messages = None
         if hasattr(req, 'contexts') and req.contexts:
-            messages = list(req.contexts)
+            raw_messages = list(req.contexts)
+            messages = self._normalize_messages(raw_messages)
             logger.info(f"{LOG_PREFIX}[{session_id}] 使用 req.contexts 获取到 {len(messages)} 条消息")
         elif hasattr(req, 'conversation') and req.conversation:
-            # 修复：添加 None 检查
             if hasattr(req.conversation, 'history') and req.conversation.history is not None:
                 raw_messages = list(req.conversation.history)
                 messages = self._normalize_messages(raw_messages)
@@ -328,10 +327,10 @@ class TokenStatsPlugin(Star):
                 messages.insert(0, system_msg)
                 logger.info(f"{LOG_PREFIX}[{session_id}] 已添加独立的 system_prompt 到消息列表")
 
-        self.session_messages[session_id] = messages
-        # 限制消息数量
-        if len(self.session_messages[session_id]) > MAX_SESSION_MESSAGES:
-            self.session_messages[session_id] = self.session_messages[session_id][-MAX_SESSION_MESSAGES:]
+        async with self._session_lock:
+            self.session_messages[session_id] = messages
+            if len(self.session_messages[session_id]) > MAX_SESSION_MESSAGES:
+                self.session_messages[session_id] = self.session_messages[session_id][-MAX_SESSION_MESSAGES:]
 
         logger.info(f"{LOG_PREFIX}[{session_id}] ===== 消息 Token 明细 =====")
         for idx, msg in enumerate(messages):
@@ -343,7 +342,10 @@ class TokenStatsPlugin(Star):
             logger.info(f"{LOG_PREFIX}[{session_id}]   role (角色): {msg.get('role')}")
             logger.info(f"{LOG_PREFIX}[{session_id}]   name (名称): {msg.get('name')}")
             logger.info(f"{LOG_PREFIX}[{session_id}]   tokens (token数): {tokens}")
-            logger.info(f"{LOG_PREFIX}[{session_id}]   content (内容): {content_text}")
+            if self.log_message_content:
+                logger.info(f"{LOG_PREFIX}[{session_id}]   content (内容): {content_text}")
+            else:
+                logger.info(f"{LOG_PREFIX}[{session_id}]   content (内容长度): {len(content_text)} 字符")
 
         if not messages:
             logger.warning(f"{LOG_PREFIX}[{session_id}] 消息列表为空")
@@ -351,7 +353,8 @@ class TokenStatsPlugin(Star):
 
         classified = self.classify_messages(messages)
         stats = self.calculate_stats(classified)
-        self.session_stats[session_id] = stats
+        async with self._session_lock:
+            self.session_stats[session_id] = stats
         await self._add_daily_tokens(session_id, stats)
 
         logger.info(f"{LOG_PREFIX}[{session_id}] Token统计详情:")
@@ -361,13 +364,12 @@ class TokenStatsPlugin(Star):
 
     @filter.on_llm_response(priority=-90)
     async def on_llm_response(self, event: AstrMessageEvent, response):
-        """捕获 LLM 响应，从 API 获取真实的 prompt_tokens 和 completion_tokens"""
         session_id = self._get_full_session_id(event)
 
         prompt_tokens = 0
         completion_tokens = 0
 
-        # 1. 尝试从 raw_completion 获取 usage（最接近原始 API 响应）
+        # 尝试从各种来源获取 usage
         if hasattr(response, 'raw_completion') and response.raw_completion:
             raw = response.raw_completion
             if hasattr(raw, 'usage') and raw.usage:
@@ -379,7 +381,6 @@ class TokenStatsPlugin(Star):
                     prompt_tokens = getattr(usage, 'prompt_tokens', 0)
                     completion_tokens = getattr(usage, 'completion_tokens', 0)
 
-        # 2. 如果还没拿到，尝试从 response.usage
         if prompt_tokens == 0 and hasattr(response, 'usage') and response.usage:
             usage = response.usage
             if isinstance(usage, dict):
@@ -389,7 +390,6 @@ class TokenStatsPlugin(Star):
                 prompt_tokens = getattr(usage, 'prompt_tokens', 0)
                 completion_tokens = getattr(usage, 'completion_tokens', 0)
 
-        # 3. 尝试从 response.completion.usage
         if prompt_tokens == 0 and hasattr(response, 'completion') and response.completion:
             completion_obj = response.completion
             if hasattr(completion_obj, 'usage') and completion_obj.usage:
@@ -401,7 +401,6 @@ class TokenStatsPlugin(Star):
                     prompt_tokens = getattr(usage, 'prompt_tokens', 0)
                     completion_tokens = getattr(usage, 'completion_tokens', 0)
 
-        # 4. 直接从 response 属性（某些包装直接暴露）
         if prompt_tokens == 0:
             for attr in ['prompt_tokens', 'input_tokens']:
                 if hasattr(response, attr):
@@ -413,20 +412,21 @@ class TokenStatsPlugin(Star):
                     completion_tokens = getattr(response, attr)
                     break
 
-        # 累加到会话统计
-        if session_id not in self.session_stats:
-            self.session_stats[session_id] = {}
-        stats = self.session_stats[session_id]
-        stats["input_tokens"] = stats.get("input_tokens", 0) + prompt_tokens
-        stats["output_tokens"] = stats.get("output_tokens", 0) + completion_tokens
+        async with self._session_lock:
+            if session_id not in self.session_stats:
+                self.session_stats[session_id] = {}
+            stats = self.session_stats[session_id]
+            stats["input_tokens"] = stats.get("input_tokens", 0) + prompt_tokens
+            stats["output_tokens"] = stats.get("output_tokens", 0) + completion_tokens
         await self._add_daily_io_tokens(session_id, prompt_tokens, completion_tokens)
         logger.debug(f"{LOG_PREFIX}[{session_id}] API 返回: 输入 {prompt_tokens}, 输出 {completion_tokens}")
 
     @filter.after_message_sent(priority=-90)
     async def after_message_sent(self, event: AstrMessageEvent):
         session_id = self._get_full_session_id(event)
-        if session_id not in self.session_messages:
-            return
+        async with self._session_lock:
+            if session_id not in self.session_messages:
+                return
         reply_text = None
         if hasattr(event, 'message_result') and event.message_result:
             if isinstance(event.message_result, list):
@@ -446,14 +446,14 @@ class TokenStatsPlugin(Star):
         if not reply_text:
             return
         assistant_msg = {"role": "assistant", "content": reply_text}
-        if self.session_messages[session_id] and self.session_messages[session_id][-1].get('role') == 'assistant':
-            last_content = self.session_messages[session_id][-1].get('content', '')
-            if last_content == reply_text:
-                return
-        self.session_messages[session_id].append(assistant_msg)
-        # 限制消息数量
-        if len(self.session_messages[session_id]) > MAX_SESSION_MESSAGES:
-            self.session_messages[session_id] = self.session_messages[session_id][-MAX_SESSION_MESSAGES:]
+        async with self._session_lock:
+            if self.session_messages[session_id] and self.session_messages[session_id][-1].get('role') == 'assistant':
+                last_content = self.session_messages[session_id][-1].get('content', '')
+                if last_content == reply_text:
+                    return
+            self.session_messages[session_id].append(assistant_msg)
+            if len(self.session_messages[session_id]) > MAX_SESSION_MESSAGES:
+                self.session_messages[session_id] = self.session_messages[session_id][-MAX_SESSION_MESSAGES:]
         logger.debug(f"{LOG_PREFIX}[{session_id}] 已追加机器人回复到消息记录")
 
     # ---------- 命令 ----------
@@ -470,7 +470,8 @@ class TokenStatsPlugin(Star):
 
         if len(parts) == 1:
             session_id = self._get_full_session_id(event)
-            stats = self.session_stats.get(session_id)
+            async with self._session_lock:
+                stats = self.session_stats.get(session_id)
             if not stats:
                 yield event.plain_result(f"当前会话（{session_id}）暂无统计数据。请先发送一条消息触发 LLM 请求。")
                 return
@@ -491,7 +492,6 @@ class TokenStatsPlugin(Star):
             if "unclassified_tokens" in stats:
                 lines.append(f"❓ 未归类: {stats['unclassified_tokens']} tokens")
             lines.append("━━━━━━━━━━━━━━━━━━")
-            # 添加注释
             lines.append("💡 注：输入/输出为 API 返回的真实值（作为计费参考），分类统计为插件计算值（用于分析消耗构成），二者可能不一致。分类统计仅计算输入，因为输出仅包含API返回的消息，无需分类")
             yield event.plain_result("\n".join(lines))
             return
@@ -521,7 +521,8 @@ class TokenStatsPlugin(Star):
     # ---------- 辅助方法 ----------
     async def _suggest_plugin_rules(self, event: AstrMessageEvent) -> str:
         session_id = self._get_full_session_id(event)
-        messages = self.session_messages.get(session_id)
+        async with self._session_lock:
+            messages = self.session_messages.get(session_id)
         if not messages:
             return "当前会话没有消息记录。请先发送一条消息触发 LLM 请求。"
         non_system = [msg for msg in messages if msg.get('role') != 'system']
@@ -586,11 +587,11 @@ class TokenStatsPlugin(Star):
         for i in range(7):
             date = (today - timedelta(days=i)).isoformat()
             total = 0
-            for session_stats in self.daily_stats.values():
-                if date in session_stats:
-                    total += session_stats[date].get("total_tokens", 0)
-            if date == today_str:
-                async with self._daily_lock:
+            async with self._daily_lock:
+                for session_stats in self.daily_stats.values():
+                    if date in session_stats:
+                        total += session_stats[date].get("total_tokens", 0)
+                if date == today_str:
                     for counters in self.current_session_today_counter.values():
                         total += counters.get("total_tokens", 0)
             lines.append(f"{date}: {total} tokens")
@@ -617,11 +618,10 @@ class TokenStatsPlugin(Star):
 
     async def _show_session_daily(self, session_input: str) -> str:
         matched_ids = []
-        # 改进匹配：支持完全相等、结尾匹配、包含匹配
-        for sid in self.daily_stats.keys():
-            if sid.endswith(f":{session_input}") or sid == session_input or session_input in sid:
-                matched_ids.append(sid)
         async with self._daily_lock:
+            for sid in self.daily_stats.keys():
+                if sid.endswith(f":{session_input}") or sid == session_input or session_input in sid:
+                    matched_ids.append(sid)
             for sid in self.current_session_today_counter.keys():
                 if sid.endswith(f":{session_input}") or sid == session_input or session_input in sid:
                     if sid not in matched_ids:
@@ -648,10 +648,10 @@ class TokenStatsPlugin(Star):
         today = datetime.now().date()
         for i in range(7):
             date = (today - timedelta(days=i)).isoformat()
-            session_hist = self.daily_stats.get(session_id, {})
-            day_data = session_hist.get(date, {})
-            total = day_data.get("total_tokens", 0)
             async with self._daily_lock:
+                session_hist = self.daily_stats.get(session_id, {})
+                day_data = session_hist.get(date, {})
+                total = day_data.get("total_tokens", 0)
                 today_counters = self.current_session_today_counter.get(session_id, {})
                 if today_counters and date == today.isoformat():
                     total += today_counters.get("total_tokens", 0)
@@ -667,95 +667,105 @@ class TokenStatsPlugin(Star):
         lines.append("━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 
-    # ---------- 独立 Web 服务 ----------
-    async def _start_web_server(self):
+    # ---------- Web 服务 ----------
+    def _check_token(self, request) -> bool:
+        """检查请求是否携带正确的 token。如果未设置 webui_token，则总是返回 True。"""
         try:
-            self.web_app = web.Application()
-            self.web_app.router.add_get('/', self._web_index)
-            self.web_app.router.add_get('/api/overview', self._api_overview)
-            self.web_app.router.add_get('/api/daily', self._api_daily)
-            self.web_app.router.add_get('/api/sessions', self._api_sessions)
-            self.web_app.router.add_get('/api/session/detail', self._api_session_detail)
-            self.web_app.router.add_get('/api/session/messages', self._api_session_messages)
-            self.web_app.router.add_get('/api/config/get', self._api_config_get)
-            self.web_app.router.add_post('/api/config/save', self._api_config_save)
-
-            self.web_runner = web.AppRunner(self.web_app)
-            await self.web_runner.setup()
-            port = 8765
-            site = web.TCPSite(self.web_runner, 'localhost', port)
-            await site.start()
-            logger.info(f"{LOG_PREFIX}独立 Web 服务已启动: http://localhost:{port}")
+            if not self.webui_token:
+                return True
+            token = request.headers.get("X-API-Token")
+            return token == self.webui_token
         except Exception as e:
-            logger.error(f"{LOG_PREFIX}启动独立 Web 服务失败: {e}")
+            logger.error(f"{LOG_PREFIX}鉴权过程发生异常: {e}", exc_info=True)
+            return False
 
     async def _web_index(self, request):
-        web_dir = os.path.join(os.path.dirname(__file__), "web")
-        index_path = os.path.join(web_dir, "index.html")
-        if os.path.exists(index_path):
+        """返回 WebUI 主页，出错时返回详细错误信息"""
+        try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            web_dir = os.path.join(self.plugin_dir, "web")
+            index_path = os.path.join(web_dir, "index.html")
+            if not os.path.exists(index_path):
+                logger.error(f"{LOG_PREFIX}WebUI 文件不存在: {index_path}")
+                return web.Response(status=404, text=f"WebUI file not found: {index_path}")
             with open(index_path, "r", encoding="utf-8") as f:
                 content = f.read()
             return web.Response(text=content, content_type='text/html')
-        else:
-            return web.Response(text="WebUI 文件未找到", status=404)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}WebUI 页面处理异常: {e}", exc_info=True)
+            import traceback
+            return web.Response(status=500, text=f"Internal Server Error:\n{traceback.format_exc()}")
 
-    # --- 统计 API ---
     async def _api_overview(self, request):
-        total_all = 0
-        today_total = 0
-        total_input = 0
-        total_output = 0
-        today_str = datetime.now().date().isoformat()
-        for session_stats in self.daily_stats.values():
-            for date, day_data in session_stats.items():
-                total_all += day_data.get("total_tokens", 0)
-                if date == today_str:
-                    today_total += day_data.get("total_tokens", 0)
-                total_input += day_data.get("input_tokens", 0)
-                total_output += day_data.get("output_tokens", 0)
-        async with self._daily_lock:
-            for counters in self.current_session_today_counter.values():
-                today_total += counters.get("total_tokens", 0)
-                total_input += counters.get("input_tokens", 0)
-                total_output += counters.get("output_tokens", 0)
-        return web.json_response({
-            "total_all": total_all,
-            "today_total": today_total,
-            "total_input": total_input,
-            "total_output": total_output
-        })
+        try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            total_all = 0
+            today_total = 0
+            total_input = 0
+            total_output = 0
+            today_str = datetime.now().date().isoformat()
+            async with self._daily_lock:
+                for session_stats in self.daily_stats.values():
+                    for date, day_data in session_stats.items():
+                        total_all += day_data.get("total_tokens", 0)
+                        if date == today_str:
+                            today_total += day_data.get("total_tokens", 0)
+                        total_input += day_data.get("input_tokens", 0)
+                        total_output += day_data.get("output_tokens", 0)
+                for counters in self.current_session_today_counter.values():
+                    today_total += counters.get("total_tokens", 0)
+                    total_input += counters.get("input_tokens", 0)
+                    total_output += counters.get("output_tokens", 0)
+            return web.json_response({
+                "total_all": total_all,
+                "today_total": today_total,
+                "total_input": total_input,
+                "total_output": total_output
+            })
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}API /api/overview 处理异常: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _api_daily(self, request):
-        days = int(request.query.get("days", 7))
-        today = datetime.now().date()
-        result = []
-        for i in range(days):
-            date = (today - timedelta(days=i)).isoformat()
-            total = 0
-            input_t = 0
-            output_t = 0
-            for session_stats in self.daily_stats.values():
-                if date in session_stats:
-                    day_data = session_stats[date]
-                    total += day_data.get("total_tokens", 0)
-                    input_t += day_data.get("input_tokens", 0)
-                    output_t += day_data.get("output_tokens", 0)
-            if date == today.isoformat():
+        try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            days = 7
+            try:
+                days = int(request.query.get("days", 7))
+            except ValueError:
+                return web.json_response({"error": "参数 days 必须是数字"}, status=400)
+            today = datetime.now().date()
+            result = []
+            for i in range(days):
+                date = (today - timedelta(days=i)).isoformat()
+                total = 0
+                input_t = 0
+                output_t = 0
                 async with self._daily_lock:
-                    for counters in self.current_session_today_counter.values():
-                        total += counters.get("total_tokens", 0)
-                        input_t += counters.get("input_tokens", 0)
-                        output_t += counters.get("output_tokens", 0)
-            result.append({"date": date, "total": total, "input": input_t, "output": output_t})
-        return web.json_response(result)
+                    for session_stats in self.daily_stats.values():
+                        if date in session_stats:
+                            day_data = session_stats[date]
+                            total += day_data.get("total_tokens", 0)
+                            input_t += day_data.get("input_tokens", 0)
+                            output_t += day_data.get("output_tokens", 0)
+                    if date == today.isoformat():
+                        for counters in self.current_session_today_counter.values():
+                            total += counters.get("total_tokens", 0)
+                            input_t += counters.get("input_tokens", 0)
+                            output_t += counters.get("output_tokens", 0)
+                result.append({"date": date, "total": total, "input": input_t, "output": output_t})
+            return web.json_response(result)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}API /api/daily 处理异常: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
 
     def _format_session_display(self, session_id: str) -> str:
-        """根据会话ID生成友好的显示名称，支持多种格式"""
         if ':' not in session_id:
             return session_id
         parts = session_id.split(':')
-        
-        # 尝试解析各种格式
         if len(parts) == 3:
             platform, msg_type, user_id = parts
             if msg_type == 'FriendMessage':
@@ -786,131 +796,142 @@ class TokenStatsPlugin(Star):
             return session_id
 
     async def _api_sessions(self, request):
-        sessions = []
-        processed_ids = set()
-        for session_id, session_hist in self.daily_stats.items():
-            processed_ids.add(session_id)
-            # 计算该会话的总消耗和插件总消耗（累计所有日期）
-            total = 0
-            plugin_total = 0
-            last_active = None
-            for date, day_data in session_hist.items():
-                total += day_data.get("total_tokens", 0)
-                # 累加插件消耗
-                for key, val in day_data.items():
-                    if key.startswith("plugin_") and key.endswith("_tokens"):
-                        plugin_total += val
-                # 记录最新日期
-                if last_active is None or date > last_active:
-                    last_active = date
-            
-            # 加上当天未迁移的数据
+        try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            sessions = []
+            processed_ids = set()
             async with self._daily_lock:
-                today_data = self.current_session_today_counter.get(session_id, {})
-                if today_data:
-                    total += today_data.get("total_tokens", 0)
-                    for key, val in today_data.items():
-                        if key.startswith("plugin_") and key.endswith("_tokens"):
-                            plugin_total += val
-                    # 当天日期可能比 last_active 新
-                    today_str = datetime.now().date().isoformat()
-                    if last_active is None or today_str > last_active:
-                        last_active = today_str
-            
-            display_name = self._format_session_display(session_id)
-            sessions.append({
-                "session_id": session_id,
-                "display_name": display_name,
-                "total": total,
-                "plugin_total": plugin_total,
-                "last_active": last_active or "无数据"
-            })
-        
-        # 添加仅有当天数据、尚未有历史记录的会话
-        async with self._daily_lock:
-            for session_id, counters in self.current_session_today_counter.items():
-                if session_id in processed_ids:
-                    continue
-                total = counters.get("total_tokens", 0)
-                plugin_total = 0
-                for key, val in counters.items():
-                    if key.startswith("plugin_") and key.endswith("_tokens"):
-                        plugin_total += val
-                display_name = self._format_session_display(session_id)
-                sessions.append({
-                    "session_id": session_id,
-                    "display_name": display_name,
-                    "total": total,
-                    "plugin_total": plugin_total,
-                    "last_active": datetime.now().date().isoformat()
-                })
-        
-        sessions.sort(key=lambda x: x["total"], reverse=True)
-        return web.json_response(sessions)
-
-    async def _api_session_detail(self, request):
-        session_id = request.query.get("session_id", "")
-        if not session_id:
-            return web.json_response({"error": "缺少 session_id 参数"}, status=400)
-        days = int(request.query.get("days", 7))
-        today = datetime.now().date()
-        result = []
-        for i in range(days):
-            date = (today - timedelta(days=i)).isoformat()
-            day_data = self.daily_stats.get(session_id, {}).get(date, {})
-            total = day_data.get("total_tokens", 0)
-            if date == today.isoformat():
-                async with self._daily_lock:
+                for session_id, session_hist in self.daily_stats.items():
+                    processed_ids.add(session_id)
+                    total = 0
+                    plugin_total = 0
+                    last_active = None
+                    for date, day_data in session_hist.items():
+                        total += day_data.get("total_tokens", 0)
+                        for key, val in day_data.items():
+                            if key.startswith("plugin_") and key.endswith("_tokens"):
+                                plugin_total += val
+                        if last_active is None or date > last_active:
+                            last_active = date
                     today_data = self.current_session_today_counter.get(session_id, {})
                     if today_data:
                         total += today_data.get("total_tokens", 0)
-            details = []
-            for cat, val in day_data.items():
-                if cat != "total_tokens" and val > 0:
-                    display = self._get_display_name(cat)
-                    details.append(f"{display}: {val}")
-            details_str = " | ".join(details) if details else "无分类数据"
-            result.append({
-                "date": date,
-                "total": total,
-                "details": details_str
-            })
-        return web.json_response(result)
+                        for key, val in today_data.items():
+                            if key.startswith("plugin_") and key.endswith("_tokens"):
+                                plugin_total += val
+                        today_str = datetime.now().date().isoformat()
+                        if last_active is None or today_str > last_active:
+                            last_active = today_str
+                    display_name = self._format_session_display(session_id)
+                    sessions.append({
+                        "session_id": session_id,
+                        "display_name": display_name,
+                        "total": total,
+                        "plugin_total": plugin_total,
+                        "last_active": last_active or "无数据"
+                    })
+                for session_id, counters in self.current_session_today_counter.items():
+                    if session_id in processed_ids:
+                        continue
+                    total = counters.get("total_tokens", 0)
+                    plugin_total = 0
+                    for key, val in counters.items():
+                        if key.startswith("plugin_") and key.endswith("_tokens"):
+                            plugin_total += val
+                    display_name = self._format_session_display(session_id)
+                    sessions.append({
+                        "session_id": session_id,
+                        "display_name": display_name,
+                        "total": total,
+                        "plugin_total": plugin_total,
+                        "last_active": datetime.now().date().isoformat()
+                    })
+            sessions.sort(key=lambda x: x["total"], reverse=True)
+            return web.json_response(sessions)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}API /api/sessions 处理异常: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _api_session_detail(self, request):
+        try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            session_id = request.query.get("session_id", "")
+            if not session_id:
+                return web.json_response({"error": "缺少 session_id 参数"}, status=400)
+            days = 7
+            try:
+                days = int(request.query.get("days", 7))
+            except ValueError:
+                return web.json_response({"error": "参数 days 必须是数字"}, status=400)
+            today = datetime.now().date()
+            result = []
+            for i in range(days):
+                date = (today - timedelta(days=i)).isoformat()
+                async with self._daily_lock:
+                    day_data = self.daily_stats.get(session_id, {}).get(date, {})
+                    total = day_data.get("total_tokens", 0)
+                    if date == today.isoformat():
+                        today_data = self.current_session_today_counter.get(session_id, {})
+                        if today_data:
+                            total += today_data.get("total_tokens", 0)
+                details = []
+                for cat, val in day_data.items():
+                    if cat != "total_tokens" and val > 0:
+                        display = self._get_display_name(cat)
+                        details.append(f"{display}: {val}")
+                details_str = " | ".join(details) if details else "无分类数据"
+                result.append({
+                    "date": date,
+                    "total": total,
+                    "details": details_str
+                })
+            return web.json_response(result)
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}API /api/session/detail 处理异常: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
 
     async def _api_session_messages(self, request):
-        session_id = request.query.get("session_id", "")
-        logger.debug(f"{LOG_PREFIX} API 请求消息: session_id={session_id}")
-        if not session_id:
-            logger.warning(f"{LOG_PREFIX} API 请求缺少 session_id")
-            return web.json_response({"error": "缺少 session_id 参数"}, status=400)
-
         try:
-            messages = self.session_messages.get(session_id, [])
-            for msg in messages:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            session_id = request.query.get("session_id", "")
+            if not session_id:
+                return web.json_response({"error": "缺少 session_id 参数"}, status=400)
+            async with self._session_lock:
+                messages = self.session_messages.get(session_id, [])
+                # 深拷贝，避免修改原数据
+                import copy
+                messages_copy = copy.deepcopy(messages)
+            for msg in messages_copy:
                 if 'content' in msg and not isinstance(msg['content'], str):
                     msg['content'] = str(msg['content'])
-            logger.debug(f"{LOG_PREFIX} 返回 {len(messages)} 条消息")
-            return web.json_response({"messages": messages})
+            return web.json_response({"messages": messages_copy})
         except Exception as e:
-            logger.error(f"{LOG_PREFIX} 获取消息失败: {e}", exc_info=True)
+            logger.error(f"{LOG_PREFIX}API /api/session/messages 处理异常: {e}", exc_info=True)
             return web.json_response({"error": f"服务器内部错误: {str(e)}"}, status=500)
 
     async def _api_config_get(self, request):
-        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
         try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            config_path = os.path.join(self.plugin_dir, "config.yaml")
             with open(config_path, "r", encoding="utf-8") as f:
                 content = f.read()
             return web.json_response({"content": content})
         except Exception as e:
-            logger.error(f"{LOG_PREFIX}读取配置文件失败: {e}")
+            logger.error(f"{LOG_PREFIX}API /api/config/get 处理异常: {e}", exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
 
     async def _api_config_save(self, request):
-        data = await request.json()
-        new_content = data.get("content", "")
-        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-        backup_path = config_path + ".bak"
         try:
+            if not self._check_token(request):
+                return web.Response(status=401, text="Unauthorized")
+            data = await request.json()
+            new_content = data.get("content", "")
+            config_path = os.path.join(self.plugin_dir, "config.yaml")
+            backup_path = config_path + ".bak"
             yaml.safe_load(new_content)
             if os.path.exists(config_path):
                 shutil.copy2(config_path, backup_path)
@@ -918,18 +939,40 @@ class TokenStatsPlugin(Star):
                 f.write(new_content)
             self.config = self._load_config()
             self.plugin_rules = self.config.get("plugins", [])
-            
-            # 不再清除会话缓存，避免丢失已有统计数据
-            # 但需要让用户知道新规则将应用于未来的请求
+            self.log_message_content = self.config.get("log_message_content", False)
+            self.webui_token = self.config.get("webui_token", "")
             logger.info(f"{LOG_PREFIX}配置已更新，新规则将在下次请求时生效。")
-            
             return web.json_response({"success": True, "message": "配置已保存，新规则将在下次请求时生效。"})
         except yaml.YAMLError as e:
             logger.error(f"{LOG_PREFIX}保存配置文件失败: YAML 格式错误 - {e}")
             return web.json_response({"error": f"YAML 格式错误: {e}"}, status=400)
         except Exception as e:
-            logger.error(f"{LOG_PREFIX}保存配置文件失败: {e}")
+            logger.error(f"{LOG_PREFIX}保存配置文件失败: {e}", exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
+
+    async def _start_web_server(self):
+        try:
+            from aiohttp import web
+            self.web_app = web.Application()
+            self.web_app.router.add_get('/', self._web_index)
+            self.web_app.router.add_get('/api/overview', self._api_overview)
+            self.web_app.router.add_get('/api/daily', self._api_daily)
+            self.web_app.router.add_get('/api/sessions', self._api_sessions)
+            self.web_app.router.add_get('/api/session/detail', self._api_session_detail)
+            self.web_app.router.add_get('/api/session/messages', self._api_session_messages)
+            self.web_app.router.add_get('/api/config/get', self._api_config_get)
+            self.web_app.router.add_post('/api/config/save', self._api_config_save)
+
+            self.web_runner = web.AppRunner(self.web_app)
+            await self.web_runner.setup()
+            port = 8765
+            site = web.TCPSite(self.web_runner, 'localhost', port)
+            await site.start()
+            logger.info(f"{LOG_PREFIX}独立 Web 服务已启动: http://localhost:{port}")
+            if self.webui_token:
+                logger.info(f"{LOG_PREFIX}WebUI 鉴权已启用，请使用 X-API-Token 头传递 token")
+        except Exception as e:
+            logger.error(f"{LOG_PREFIX}启动独立 Web 服务失败: {e}")
 
     async def terminate(self):
         async with self._daily_lock:
