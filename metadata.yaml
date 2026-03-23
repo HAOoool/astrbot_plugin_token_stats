@@ -2,7 +2,7 @@ name: astrbot_plugin_token_stats
 desc: 自动统计每次 LLM 请求的 token 消耗，支持 /tokenstats 命令查询，按会话区分统计
 author: HAOoool
 version: 3.9.15
-repo: https://github.com/HAOoool/AstrBot-Token-.git
+repo:https://github.com/HAOoool/AstrBot-Token-
 display_name: Token统计插件
 support_platforms:
   - aiocqhttp
