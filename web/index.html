@@ -417,12 +417,12 @@
         </div>
         <table id="sessions-table">
             <thead>
-                <tr>
+                 <tr>
                     <th data-sort="display_name">会话ID</th>
                     <th data-sort="total" data-order="desc">总消耗 (tokens) <span class="sort-indicator">▼</span></th>
                     <th data-sort="plugin_total">插件消耗 (tokens) <span class="sort-indicator"></span></th>
                     <th data-sort="last_active">最近活跃 <span class="sort-indicator"></span></th>
-                </tr>
+                 </tr>
             </thead>
             <tbody id="session-tbody">
                 <tr><td colspan="4" class="loading">加载中...</td></tr>
@@ -525,7 +525,6 @@
             localStorage.removeItem('tokenStatsToken');
         }
         updateTokenUI();
-        // 重新加载所有数据
         reloadAllData();
     }
     document.getElementById('save-token-btn').addEventListener('click', () => {
@@ -534,7 +533,6 @@
     });
     updateTokenUI();
 
-    // 为 fetch 自动添加 Authorization 头
     async function fetchWithToken(url, options = {}) {
         const headers = options.headers || {};
         if (currentApiToken) {
@@ -542,7 +540,6 @@
         }
         const res = await fetch(url, { ...options, headers });
         if (res.status === 401) {
-            // Token 无效，清除并提示
             alert('Token 无效或已过期，请重新输入正确的 API Token。');
             setApiToken('');
             throw new Error('Unauthorized');
@@ -556,11 +553,9 @@
         return await res.json();
     }
 
-    // 重新加载所有数据（用于 token 变更后）
     async function reloadAllData() {
         try {
             await Promise.all([loadOverview(), loadDaily(), loadSessions()]);
-            // 如果当前在配置页，也重新加载配置
             if (document.getElementById('config-tab').classList.contains('active')) {
                 loadConfig();
                 loadSessionSelect();
@@ -814,30 +809,25 @@
         renderRules();
     }
 
-    // 修复：图形化保存规则时，保留原配置文件的其他字段（如 log_message_content, webui_token 等）
     async function saveGraphicalRules() {
+        // 获取当前 YAML 内容
+        const currentYaml = document.getElementById('config-editor').value;
+        let fullConfig;
         try {
-            // 1. 先获取当前完整配置
-            const configRes = await fetchWithToken('/api/config/get');
-            const configData = await configRes.json();
-            if (!configData.content) {
-                throw new Error('无法获取当前配置');
-            }
-            let fullConfig;
-            try {
-                fullConfig = jsyaml.load(configData.content);
-            } catch (e) {
-                throw new Error('解析当前配置失败: ' + e.message);
-            }
-            // 确保 fullConfig 是对象
-            if (!fullConfig || typeof fullConfig !== 'object') {
-                fullConfig = {};
-            }
-            // 2. 更新 plugins 字段
-            fullConfig.plugins = currentRules;
-            // 3. 转换为 YAML 字符串
-            const newYaml = jsyaml.dump(fullConfig, { indent: 2 });
-            // 4. 保存
+            fullConfig = jsyaml.load(currentYaml);
+            if (!fullConfig || typeof fullConfig !== 'object') fullConfig = {};
+        } catch (e) {
+            console.error('解析当前 YAML 失败，将创建新配置', e);
+            fullConfig = {};
+        }
+        // 替换 plugins 字段
+        fullConfig.plugins = currentRules;
+        // 确保其他必要字段存在（如果原本没有，就保留默认）
+        if (fullConfig.log_message_content === undefined) fullConfig.log_message_content = false;
+        if (fullConfig.webui_token === undefined) fullConfig.webui_token = "";
+        // 转换为 YAML
+        const newYaml = jsyaml.dump(fullConfig, { indent: 2 });
+        try {
             const res = await fetchWithToken('/api/config/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -855,7 +845,7 @@
             }
         } catch (e) {
             console.error('保存规则失败', e);
-            document.getElementById('graphical-status').innerText = '❌ 保存失败: ' + e.message;
+            document.getElementById('graphical-status').innerText = '❌ 网络错误';
         }
     }
 
