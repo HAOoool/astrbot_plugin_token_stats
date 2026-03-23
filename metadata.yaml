@@ -1,5 +1,25 @@
 name: astrbot_plugin_token_stats
-desc: 自动统计每次 LLM 请求的 token 消耗，支持 /tokenstats 命令查询，按会话区分统计
+desc: 自动统计每次 LLM 请求的 token 消耗，支持 /tokenstats 命令查询，按会话区分统计" 与JSON中提交的desc "AstrBot Token统计插件 是一个轻量级但功能强大的工具，帮助 AstrBot 用户精确追踪每次与 AI 交互时的 token 消耗。无论是分析成本构成，还是优化提示词设计，它都能提供清晰的数据支持。
+
+核心功能
+实时统计：自动捕获每次 LLM 请求的输入/输出 token 真实值（基于 API 返回）。
+
+会话级统计：按私聊/群聊独立统计，并持久化每日数据，支持跨天查看。
+
+分类分析：将消息分为“人格提示词”“上下文对话”“插件消息”等类别，直观展示消耗分布。
+
+插件归属规则：支持自定义规则，将特定插件（如记忆、知识库）的消息单独归类统计。
+
+WebUI 可视化：提供独立网页界面，展示总消耗趋势、会话排行，并支持图形化配置规则，无需手动编辑 YAML。
+
+智能建议：输入 /tokenstats suggest，插件会根据近期对话自动推荐归属规则，降低配置门槛。
+
+适用场景
+想了解 token 主要花费在哪些环节（人格、对话、插件）。
+
+需要为不同插件分别统计成本。
+
+优化提示词或对话长度以节省费用。
 author: HAOoool
 version: 3.9.15
 repo: https://github.com/HAOoool/AstrBot-Token
